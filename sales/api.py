@@ -88,6 +88,7 @@ def order_detail_json(request, order_id):
         'total_discount': float(order.total_discount),
         'created_at': order.created_at.isoformat(),
         'invoice_number': order.invoice_number or '',
+        'internal_notes': order.internal_notes or '',
         'items': items,
         'payments': payments
     })
@@ -109,6 +110,70 @@ def order_cancel(request, order_id):
     order.save()
     
     return JsonResponse({'success': True, 'message': 'Venta cancelada correctamente'})
+
+@require_http_methods(["POST"])
+@require_gym_permission('sales.change_sale')
+def order_update(request, order_id):
+    """
+    Updates an order's date, time, and internal notes.
+    """
+    gym = request.gym
+    order = get_object_or_404(Order, id=order_id, gym=gym)
+    
+    try:
+        data = json.loads(request.body)
+        
+        # Update date/time if provided
+        if data.get('date') and data.get('time'):
+            from datetime import datetime as dt
+            new_datetime = dt.strptime(f"{data['date']} {data['time']}", "%Y-%m-%d %H:%M")
+            order.created_at = new_datetime
+        
+        # Update internal notes
+        if 'internal_notes' in data:
+            order.internal_notes = data['internal_notes']
+        
+        order.save()
+        return JsonResponse({'success': True, 'message': 'Venta actualizada'})
+    except Exception as e:
+        return JsonResponse({'error': str(e)}, status=400)
+
+@require_http_methods(["POST"])
+@require_gym_permission('sales.view_sale')
+def order_send_ticket(request, order_id):
+    """
+    Sends ticket/receipt via email to client.
+    """
+    gym = request.gym
+    order = get_object_or_404(Order, id=order_id, gym=gym)
+    
+    try:
+        data = json.loads(request.body)
+        email = data.get('email')
+        
+        if not email:
+            return JsonResponse({'error': 'Email requerido'}, status=400)
+        
+        # Render email template
+        html_content = render_to_string('emails/ticket_receipt.html', {
+            'order': order,
+            'gym': gym,
+            'items': order.items.all(),
+            'payments': order.payments.all()
+        })
+        
+        email_msg = EmailMessage(
+            subject=f'Tu ticket de compra - {gym.name} #{order.id}',
+            body=html_content,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            to=[email]
+        )
+        email_msg.content_subtype = 'html'
+        email_msg.send()
+        
+        return JsonResponse({'success': True, 'message': f'Ticket enviado a {email}'})
+    except Exception as e:
+        return JsonResponse({'error': str(e)}, status=500)
 
 from decimal import Decimal
 
@@ -177,10 +242,15 @@ def search_products(request):
 @require_gym_permission('sales.view_sale')
 def search_clients(request):
     query = request.GET.get('q', '').strip()
+    client_id = request.GET.get('id')  # Direct ID lookup
     gym = request.gym
     
     clients = Client.objects.filter(gym=gym)
-    if query:
+    
+    # Direct ID lookup takes priority
+    if client_id:
+        clients = clients.filter(id=client_id)
+    elif query:
         # Check if query is numeric for ID search
         if query.isdigit():
              clients = clients.filter(id=query) | clients.filter(dni__icontains=query)
@@ -192,7 +262,10 @@ def search_clients(request):
         results.append({
             'id': c.id,
             'text': str(c),
-            'email': c.email
+            'email': c.email,
+            'first_name': c.first_name,
+            'last_name': c.last_name,
+            'status': c.status
         })
     
     return JsonResponse({'results': results})

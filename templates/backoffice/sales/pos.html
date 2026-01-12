@@ -446,16 +446,17 @@
                 }
             },
 
-            async preSelectClient(id) {
+            async preSelectClient(clientId) {
                 try {
-                    this.clientQuery = id;
-                    await this.searchClients();
-                    const match = this.clientResults.find(c => c.id == id);
-                    if (match) {
-                        await this.selectClient(match);
+                    // Use dedicated 'id' parameter for direct lookup
+                    const url = `${this.endpoints.clients_search}?id=${clientId}`;
+                    const res = await fetch(url);
+                    const data = await res.json();
+                    if (data.results && data.results.length > 0) {
+                        await this.selectClient(data.results[0]);
                     }
                 } catch (e) {
-                    console.error(e);
+                    console.error("Error pre-selecting client:", e);
                 }
             },
 
