@@ -77,7 +77,7 @@
                 <!-- Tags -->
                 {% for tag in client.tags.all %}
                 <span class="text-[10px] px-2 py-0.5 rounded-md border"
-                    style="background-color: {{ tag.color }}10; border-color: {{ tag.color }}30; color: {{ tag.color }}">
+                    style="--tag-color: {{ tag.color }}; --tag-bg: {{ tag.color }}10; --tag-border: {{ tag.color }}30; background-color: var(--tag-bg); border-color: var(--tag-border); color: var(--tag-color);">
                     {{ tag.name }}
                 </span>
                 {% endfor %}
@@ -580,6 +580,9 @@
                             <!-- Amount -->
                             <div class="text-right min-w-[80px]">
                                 <div class="font-bold text-slate-900">{{ order.total_amount }}€</div>
+                                <div class="text-[10px] text-slate-400 mt-1" title="Cobrado por">
+                                    👤 {{ order.created_by.first_name|default:order.created_by.email }}
+                                </div>
                             </div>
                             <!-- Hover Actions -->
                             <div class="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
@@ -598,9 +601,6 @@
                                     class="p-2 rounded-lg text-slate-400 hover:text-amber-500 hover:bg-amber-50 transition-colors"
                                     title="Editar venta">
                                     <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                                            d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z">
-                                        </path>
                                     </svg>
                                 </button>
                                 <!-- Print Ticket -->
@@ -610,6 +610,17 @@
                                     <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
                                             d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z">
+                                        </path>
+                                    </svg>
+                                </button>
+                                <!-- Generate Invoice -->
+                                <button x-show="!{{ order.invoice_number|yesno:'true,false' }}"
+                                    @click.stop="generateInvoice({{ order.id }})"
+                                    class="p-2 rounded-lg text-slate-400 hover:text-purple-600 hover:bg-purple-50 transition-colors"
+                                    title="Generar Factura">
+                                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                            d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z">
                                         </path>
                                     </svg>
                                 </button>
@@ -737,6 +748,26 @@
                                     class="w-full px-3 py-2 border border-slate-200 rounded-xl focus:ring-2 focus:ring-[var(--brand-color)] focus:border-transparent">
                             </div>
                         </div>
+                        <!-- Payment Methods (permission-gated) -->
+                        {% if perms.sales.change_sale %}
+                        <div x-show="editingOrder?.payments?.length > 0">
+                            <label class="block text-sm font-medium text-slate-700 mb-2">Método de pago</label>
+                            <template x-for="(payment, index) in editingOrder?.payments || []" :key="index">
+                                <div class="flex items-center gap-3 mb-2 p-3 bg-slate-50 rounded-xl">
+                                    <div class="flex-1">
+                                        <select x-model="editForm.payments[index]"
+                                            class="w-full px-3 py-2 border border-slate-200 rounded-xl focus:ring-2 focus:ring-[var(--brand-color)] focus:border-transparent bg-white">
+                                            {% for pm in payment_methods %}
+                                            <option value="{{ pm.id }}">{{ pm.name }}</option>
+                                            {% endfor %}
+                                        </select>
+                                    </div>
+                                    <div class="text-sm font-semibold text-slate-600" x-text="payment.amount + '€'">
+                                    </div>
+                                </div>
+                            </template>
+                        </div>
+                        {% endif %}
                         <!-- Notes -->
                         <div>
                             <label class="block text-sm font-medium text-slate-700 mb-1">Notas internas</label>
@@ -847,11 +878,22 @@
                                 const order = await res.json();
                                 this.editingOrder = order;
                                 const dt = new Date(order.created_at);
+
+                                // Map payments to editable format (array of method IDs)
+                                const payments = order.payments.map(p => p.method_id);
+
                                 this.editForm = {
                                     date: dt.toISOString().split('T')[0],
                                     time: dt.toTimeString().slice(0, 5),
-                                    notes: order.internal_notes || ''
+                                    notes: order.internal_notes || '',
+                                    payments: payments
                                 };
+
+                                // Since I haven't fixed the API in this turn, I will do a quick fix to the API in next turn?
+                                // OR better: The HTML uses `payment_methods` context variable which has name/id.
+                                // I can try to match name.
+                                // Better: Update API.
+
                                 this.showEditModal = true;
                             }
                         } catch (e) {
@@ -860,9 +902,41 @@
                         }
                     },
 
+                    async generateInvoice(orderId) {
+                        try {
+                            const res = await fetch(`/sales/api/order/${orderId}/invoice/`, {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'X-CSRFToken': '{{ csrf_token }}'
+                                },
+                                body: JSON.stringify({})
+                            });
+                            const data = await res.json();
+                            if (res.ok) {
+                                alert(data.message);
+                                window.location.reload();
+                            } else {
+                                alert(data.error);
+                            }
+                        } catch (e) {
+                            alert("Error generating invoice");
+                        }
+                    },
+
                     async saveOrderEdit() {
                         if (!this.editingOrder) return;
                         this.isSaving = true;
+
+                        // Reconstruct payments array for API
+                        // API expects: payments: [ { method_id: 1, amount: 50 }, ... ]
+                        // editForm.payments is simple array of method_ids [1, 2] corresponding to editingOrder.payments indices
+
+                        const paymentsPayload = this.editingOrder.payments.map((p, index) => ({
+                            method_id: this.editForm.payments[index],
+                            amount: p.amount,
+                            transaction_id: p.transaction_id
+                        }));
 
                         try {
                             const res = await fetch(`/sales/api/order/${this.editingOrder.id}/update/`, {
@@ -874,10 +948,12 @@
                                 body: JSON.stringify({
                                     date: this.editForm.date,
                                     time: this.editForm.time,
-                                    internal_notes: this.editForm.notes
+                                    internal_notes: this.editForm.notes,
+                                    payments: paymentsPayload
                                 })
                             });
 
+                            // ... existing handling ...
                             if (res.ok) {
                                 window.location.reload();
                             } else {

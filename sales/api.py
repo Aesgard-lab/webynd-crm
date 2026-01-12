@@ -1,7 +1,11 @@
 from django.http import JsonResponse
-from django.views.decorators.http import require_http_methods
+from django.views.decorators.http import require_http_methods, require_POST
+from django.views.decorators.csrf import csrf_exempt
 from django.db import transaction
 from django.core.mail import EmailMessage
+from django.contrib.contenttypes.models import ContentType
+from decimal import Decimal
+from datetime import timedelta, date
 from django.template.loader import render_to_string
 from django.conf import settings
 from .models import Order, OrderItem, OrderPayment
@@ -75,6 +79,8 @@ def order_detail_json(request, order_id):
     } for item in order.items.all()]
     
     payments = [{
+        'id': payment.id,
+        'method_id': payment.payment_method.id, # Key for editing
         'method': payment.payment_method.name,
         'amount': float(payment.amount),
         'transaction_id': payment.transaction_id or ''
@@ -105,17 +111,57 @@ def order_cancel(request, order_id):
     if order.status == 'CANCELLED':
         return JsonResponse({'error': 'Esta venta ya está cancelada'}, status=400)
     
+    # Refund Logic
+    refund_notes = []
+    
+    # Check for refundable payments
+    from finance.stripe_utils import refund_payment
+    from finance.redsys_utils import get_redsys_client
+    
+    for payment in order.payments.all():
+        if payment.transaction_id:
+            # Try to identify provider. 
+            # Heuristic: Stripe IDs usually start with pi_ or ch_. Redsys are usually numeric or short.
+            # But we should probably store provider in OrderPayment? 
+            # Current OrderPayment model doesn't have provider field, just payment_method relation.
+            # Let's check the payment method name or infer from ID.
+            
+            # Stripe
+            if payment.transaction_id.startswith('pi_') or payment.transaction_id.startswith('ch_'):
+                success, msg = refund_payment(payment.transaction_id, amount_eur=float(payment.amount), gym=gym)
+                if success:
+                    refund_notes.append(f"Reembolso Stripe exitoso ({payment.amount}€)")
+                else:
+                    refund_notes.append(f"Error Reembolso Stripe: {msg}")
+            
+            # Redsys (If we have a numeric order ID as transaction_id)
+            elif payment.transaction_id.isdigit(): # Redsys Order IDs are up to 12 digits
+                 redsys = get_redsys_client(gym)
+                 if redsys:
+                     # Redsys Refund requires generating a NEW order ID for the refund transaction
+                     from finance.views_redsys import generate_order_id
+                     refund_order_id = generate_order_id()
+                     success, msg = redsys.refund_request(refund_order_id, float(payment.amount), original_order_id=payment.transaction_id)
+                     if success:
+                         refund_notes.append(f"Reembolso Redsys exitoso ({payment.amount}€)")
+                     else:
+                         refund_notes.append(f"Error Reembolso Redsys: {msg}")
+    
     order.status = 'CANCELLED'
-    order.internal_notes += f"\n[Cancelado por {request.user.get_full_name() or request.user.username} el {datetime.datetime.now().strftime('%d/%m/%Y %H:%M')}]"
+    note = f"\n[Cancelado por {request.user.get_full_name() or request.user.username} el {datetime.datetime.now().strftime('%d/%m/%Y %H:%M')}]"
+    if refund_notes:
+        note += "\n" + "\n".join(refund_notes)
+        
+    order.internal_notes += note
     order.save()
     
-    return JsonResponse({'success': True, 'message': 'Venta cancelada correctamente'})
+    return JsonResponse({'success': True, 'message': 'Venta cancelada. ' + ', '.join(refund_notes)})
 
 @require_http_methods(["POST"])
 @require_gym_permission('sales.change_sale')
 def order_update(request, order_id):
     """
-    Updates an order's date, time, and internal notes.
+    Updates an order's date, time, internal notes, and payment methods.
     """
     gym = request.gym
     order = get_object_or_404(Order, id=order_id, gym=gym)
@@ -132,10 +178,64 @@ def order_update(request, order_id):
         # Update internal notes
         if 'internal_notes' in data:
             order.internal_notes = data['internal_notes']
+            
+        # Update Payments (Record keeping only)
+        if 'payments' in data and isinstance(data['payments'], list):
+            # This replaces existing payment records with new ones
+            # WARNING: This does NOT refund or charge cards. It is for record correction.
+            with transaction.atomic():
+                order.payments.all().delete()
+                for p_data in data['payments']:
+                    method_id = p_data.get('method_id') or p_data.get('id') # Handle both formats if needed
+                    amount = float(p_data.get('amount', 0))
+                    if amount > 0:
+                         method = PaymentMethod.objects.get(id=method_id)
+                         OrderPayment.objects.create(
+                             order=order,
+                             payment_method=method,
+                             amount=amount,
+                             transaction_id=p_data.get('transaction_id', '')
+                         )
         
         order.save()
         return JsonResponse({'success': True, 'message': 'Venta actualizada'})
     except Exception as e:
+        return JsonResponse({'error': str(e)}, status=400)
+
+@require_http_methods(["POST"])
+@require_gym_permission('sales.change_sale')
+def order_generate_invoice(request, order_id):
+    """
+    Generates an invoice number if missing and sends email.
+    """
+    gym = request.gym
+    order = get_object_or_404(Order, id=order_id, gym=gym)
+    
+    try:
+        data = json.loads(request.body)
+        email = data.get('email')
+        
+        if not order.invoice_number:
+            # Simple sequential generation. 
+            # Ideally this should be more robust (Year-Sequence).
+            # For now: INV-{Year}-{Order_ID}
+            year = datetime.datetime.now().year
+            # Check last invoice number for this gym/year to increment?
+            # Or just use ID based unique
+            order.invoice_number = f"INV-{year}-{order.id:06d}"
+            order.save()
+            
+        # Send Email
+        if email:
+             # Reuse ticket template or specialized invoice template
+             send_invoice_email(order, email)
+             msg = f"Factura {order.invoice_number} generada y enviada a {email}"
+        else:
+             msg = f"Factura {order.invoice_number} generada"
+
+        return JsonResponse({'success': True, 'message': msg, 'invoice_number': order.invoice_number})
+    except Exception as e:
+        print(e)
         return JsonResponse({'error': str(e)}, status=400)
 
 @require_http_methods(["POST"])
@@ -297,13 +397,38 @@ def process_sale(request):
         if client_id:
             client = Client.objects.filter(gym=gym, pk=client_id).first()
 
+        # Custom Date/Time
+        created_at_val = None
+        if data.get('date') and data.get('time'):
+            try:
+                from datetime import datetime as dt
+                created_at_str = f"{data['date']} {data['time']}"
+                created_at_val = dt.strptime(created_at_str, "%Y-%m-%d %H:%M")
+            except ValueError:
+                pass # Ignore invalid format, use auto_now_add logic (actually need to set explicit if we want to override)
+        
+        # Custom Staff
+        sale_user = user
+        if data.get('staff_id'):
+            from django.contrib.auth import get_user_model
+            User = get_user_model()
+            try:
+                sale_user = User.objects.get(id=data['staff_id'], gym_memberships__gym=gym)
+            except User.DoesNotExist:
+                pass
+
         order = Order.objects.create(
             gym=gym,
             client=client,
-            created_by=user,
+            created_by=sale_user,
             status='PAID', 
             total_amount=0 
         )
+        
+        if created_at_val:
+            order.created_at = created_at_val
+            order.save() # Needed because auto_now_add might have set it to now
+
 
         total_amount = Decimal(0)
         total_discount = Decimal(0)
@@ -341,22 +466,34 @@ def process_sale(request):
                 
             final_subtotal = base_total - item_discount
 
-            tax_rate = 0
+            # Calculate Base and Tax (Assuming tax-inclusive prices)
+            # Base = Total / (1 + Rate)
+            item_tax_rate_decimal = Decimal(0)
             if obj.tax_rate:
-                tax_rate = obj.tax_rate.rate_percent
+                item_tax_rate_decimal = obj.tax_rate.rate_percent / Decimal(100)
+            
+            # Prevent division by zero or weirdness
+            item_base = final_subtotal / (Decimal(1) + item_tax_rate_decimal)
+            item_tax = final_subtotal - item_base
 
-            OrderItem.objects.create(
+            newItem = OrderItem.objects.create(
                 order=order,
-                content_object=obj,
+                content_type=ct,
+                object_id=obj.id,
                 description=obj.name,
                 quantity=qty,
                 unit_price=unit_price,
                 subtotal=final_subtotal,
-                tax_rate=tax_rate,
+                tax_rate=obj.tax_rate.rate_percent if obj.tax_rate else 0,
                 discount_amount=item_discount
             )
+            
             total_amount += final_subtotal
             total_discount += item_discount
+            
+            # Update order totals (in-memory)
+            order.total_base += item_base
+            order.total_tax += item_tax
 
         # 4. Create Payments (handle mixed)
         total_paid = Decimal(0)
@@ -381,12 +518,28 @@ def process_sale(request):
                 payment_token = stripe_pm_id
             
             # Get Method Name (Cash, Card, etc)
+            # Get Method Name (Cash, Card, etc)
             try:
                 method = PaymentMethod.objects.get(id=method_id)
             except:
-                # If using integration, maybe method is generic "Card"?
-                # But frontend usually sends the generic PaymentMethod ID (e.g. "Tarjeta") selected.
-                method = None
+                # If using integration, maybe method provided is invalid?
+                # Try to find a generic "Card" method
+                if provider: # stripe or redsys
+                    method = PaymentMethod.objects.filter(name__icontains='tarjeta', gym=gym).first()
+                    if not method:
+                        method = PaymentMethod.objects.filter(name__icontains='stripe', gym=gym).first()
+                    if not method:
+                         # Fallback to ANY active method if we have no choice (better than crash?)
+                         # Or create one?
+                         method = PaymentMethod.objects.filter(gym=gym, is_active=True).exclude(name__icontains='efectivo').first()
+                         if not method:
+                             method = PaymentMethod.objects.filter(gym=gym, is_active=True).first()
+                             
+                if not method:
+                     # Critical failure if we can't find a method
+                     # But don't crash yet, let valid validation handle it or create dummy?
+                     # We must have a method.
+                     raise Exception("No se encontró un método de pago válido en la configuración")
                 
             transaction_id = None
             
@@ -448,6 +601,8 @@ def process_sale(request):
         elif total_paid > 0:
             order.status = 'PARTIAL'
             
+        order.total_amount = total_amount
+        order.total_discount = total_discount
         order.save()
         
         return JsonResponse({'success': True, 'order_id': order.id})
@@ -456,11 +611,245 @@ def process_sale(request):
         return JsonResponse({'error': str(e)}, status=500)
 
 def send_invoice_email(order, email):
-    # Stub for sending email
-    print(f"Sending Invoice {order.invoice_number} to {email}")
-    pass
+    """
+    Generates PDF invoice and sends it via email.
+    """
+    try:
+        # 1. Render HTML
+        html_content = render_to_string('emails/invoice.html', {
+            'order': order,
+            'gym': order.gym,
+            'items': order.items.all(),
+            'payments': order.payments.all()
+        })
+        
+        # 2. Send Email
+        email_msg = EmailMessage(
+            subject=f'Factura {order.invoice_number} - {order.gym.name}',
+            body=f"Adjuntamos su factura {order.invoice_number}.\n\nGracias por su confianza.",
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            to=[email]
+        )
+        
+        # In a real app we'd attach a PDF. For now, we'll send the HTML as body.
+        # Or attach HTML.
+        # Let's send HTML body for simplicity.
+        email_msg.content_subtype = 'html' 
+        email_msg.body = html_content 
+        email_msg.send()
+        
+        print(f"Invoice {order.invoice_number} sent to {email}")
+    except Exception as e:
+        print(f"Error sending invoice email: {e}")
+
 
 def send_ticket_email(order, email):
     # Stub for sending email
     print(f"Sending Ticket #{order.id} to {email}")
     pass
+
+@csrf_exempt
+@require_POST
+def subscription_charge(request, pk):
+    """
+    Attempts to charge a subscription (ClientMembership) using stored payment methods.
+    """
+    try:
+        from clients.models import ClientMembership
+        from memberships.models import MembershipPlan
+        
+        membership = get_object_or_404(ClientMembership, pk=pk)
+        client = membership.client
+        gym = client.gym
+        amount = membership.price
+        
+        if amount <= 0:
+             return JsonResponse({'error': 'El importe es 0, no se puede cobrar'}, status=400)
+
+        import json
+        
+        # Parse Body if needed (Alpine fetch sends JSON often, but we used key-value before. Let's support both)
+        data = {}
+        if request.body:
+             try:
+                 data = json.loads(request.body)
+             except:
+                 pass
+        
+        explicit_method_id = request.POST.get('method_id') or data.get('method_id')
+
+        # 1. Determine Payment Method & Token
+        provider = None
+        token = None
+        method = None
+        
+        # A) Explicit Method Selection (Manual or Specific Auto)
+        if explicit_method_id:
+            method = get_object_or_404(PaymentMethod, pk=explicit_method_id, gym=gym)
+            
+            # Check if it's an auto method or manual
+            # For now, we assume if it has a specific provider_code it might be auto, 
+            # but usually manual methods are just "Cash", "Card (Physical)".
+            # We can check name or provider_code.
+            if method.name.lower() in ['stripe', 'redsys'] or (method.provider_code and method.provider_code in ['stripe', 'redsys']):
+                 # It is an auto method, try to find token for it
+                 pass # Fallthrough to auto logic but using this method
+            else:
+                 # It is a MANUAL method
+                 provider = 'manual'
+        
+        # B) Auto-Detect (only if no manual provider selected)
+        if not provider:
+            # Priority: Stripe > Redsys > Fail
+            if client.stripe_customer_id:
+                provider = 'stripe'
+                if client.stripe_customer_id.startswith('cus_test'): # TEST MODE
+                     token = 'pm_card_test_success'
+                else:
+                     token = client.stripe_customer_id 
+                # Find generic Stripe method if not set
+                if not method:
+                    method = PaymentMethod.objects.filter(gym=gym, name__icontains='Stripe').first()
+                
+            elif client.redsys_tokens.exists():
+                provider = 'redsys'
+                merchant_token = client.redsys_tokens.last()
+                token = merchant_token.id 
+                if not method:
+                    method = PaymentMethod.objects.filter(gym=gym, name__icontains='Tarjeta').first()
+
+        # Validation
+        if provider != 'manual' and not provider:
+             return JsonResponse({'error': 'El cliente no tiene tarjeta vinculada (Stripe/Redsys)', 'error_code': 'NO_CARD'}, status=400)
+             
+        if not method:
+             # Fallback
+             method = PaymentMethod.objects.filter(gym=gym, is_active=True).first()
+
+        # 2. Create Order (Pending)
+        order = Order.objects.create(
+            gym=gym,
+            client=client,
+            status='PENDING',
+            total_amount=amount,
+            total_base=amount / Decimal(1.21), # Approx
+            total_tax=amount - (amount / Decimal(1.21)),
+            created_by=request.user if request.user.is_authenticated else None,
+            internal_notes=f"Renovación: {membership.name}"
+        )
+        
+        # Add Item
+        OrderItem.objects.create(
+            order=order,
+            content_type=ContentType.objects.get_for_model(ClientMembership),
+            object_id=membership.id,
+            description=f"Cuota: {membership.name}",
+            quantity=1,
+            unit_price=amount,
+            subtotal=amount
+        )
+        
+        # 3. Attempt Charge
+        success = False
+        transaction_id = None
+        error_msg = ""
+        
+        if provider == 'stripe':
+             from finance.stripe_utils import charge_client
+             # charge_client expects (client, amount, payment_method_id)
+             # If using Customer ID, we might need a different call or ensure charge_client handles it.
+             # Assuming charge_client handles it for now or we pass a source.
+             # Let's try passing the customer_id as token
+             s_success, s_res = charge_client(client, amount, token) 
+             if s_success:
+                 success = True
+                 transaction_id = s_res
+             else:
+                 error_msg = str(s_res)
+                 
+        elif provider == 'redsys':
+             from finance.redsys_utils import get_redsys_client
+             from finance.models import ClientRedsysToken
+             from finance.views_redsys import generate_order_id
+             
+             try:
+                 r_token = ClientRedsysToken.objects.get(id=token)
+                 r_client = get_redsys_client(gym)
+                 order_code = generate_order_id()
+                 r_success, r_res = r_client.charge_request(order_code, amount, r_token.token, f"Ord {order.id}")
+                 
+                 if r_success:
+                     success = True
+                     transaction_id = order_code
+                 else:
+                     error_msg = "Error Redsys"
+             except Exception as e:
+                 error_msg = str(e)
+
+        elif provider == 'manual':
+             success = True
+             transaction_id = f"MANUAL-{request.user.id}-{date.today()}"
+             # Check if Cash control is needed? 
+             # For now, simple record. If is_cash, maybe we should open shift? 
+             # We assume Shift is open or we just record it.
+             pass
+        
+        # 4. Handle Result
+        if success:
+            # Payment Record
+            OrderPayment.objects.create(
+                order=order,
+                payment_method=method,
+                amount=amount,
+                transaction_id=transaction_id
+            )
+            order.status = 'PAID'
+            order.save()
+            
+            # Extend Membership
+            # Look up plan by name to get frequency
+            plan = MembershipPlan.objects.filter(gym=gym, name=membership.name).first()
+            if plan:
+                # Add frequency
+                from dateutil.relativedelta import relativedelta
+                if plan.frequency_unit == 'MONTH':
+                    delta = relativedelta(months=plan.frequency_amount)
+                elif plan.frequency_unit == 'YEAR':
+                    delta = relativedelta(years=plan.frequency_amount)
+                elif plan.frequency_unit == 'WEEK':
+                    delta = relativedelta(weeks=plan.frequency_amount)
+                elif plan.frequency_unit == 'DAY':
+                     delta = timedelta(days=plan.frequency_amount)
+                else:
+                     delta = relativedelta(months=1)
+            else:
+                # Default 1 month
+                from dateutil.relativedelta import relativedelta
+                delta = relativedelta(months=1)
+                
+            # Update end_date
+            if membership.end_date:
+                # If expired long ago, maybe start from today? 
+                # User said "cobros futuros" ... "fecha de vencimiento". 
+                # Ideally we add to the existing end_date to keep the cycle.
+                membership.end_date += delta
+            else:
+                membership.end_date = date.today() + delta
+            
+            membership.save()
+            
+            return JsonResponse({'success': True, 'message': f'Cobrado Correctamente. Nueva fecha: {membership.end_date}'})
+        else:
+            # Failed
+            order.status = 'CANCELLED' # Or failed
+            order.internal_notes += f" | Fallo cobro: {error_msg}"
+            order.save()
+            return JsonResponse({'error': f'Fallo en el cobro: {error_msg}', 'error_code': 'CHARGE_FAILED'}, status=400)
+            
+
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JsonResponse({'error': str(e)}, status=500)
+

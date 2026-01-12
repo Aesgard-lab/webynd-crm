@@ -4,6 +4,10 @@ from django.contrib import messages
 from accounts.decorators import require_gym_permission
 from .models import TaxRate, PaymentMethod, FinanceSettings
 from .forms import TaxRateForm, PaymentMethodForm, FinanceSettingsForm
+from datetime import datetime, timedelta, date
+from django.db.models import Sum, Count
+from django.db.models.functions import TruncDate
+from sales.models import Order
 
 @login_required
 @require_gym_permission('finance.view_finance') 
@@ -159,3 +163,104 @@ def method_delete(request, pk):
         'object': pm,
         'back_url': 'finance_settings'
     })
+
+# --- Reports ---
+
+@login_required
+@require_gym_permission('finance.view_finance')
+def billing_dashboard(request):
+    gym = request.gym
+    
+    # 1. Date Filters
+    date_range = request.GET.get('range', 'today') # today, yesterday, week, month, custom
+    date_start_str = request.GET.get('start')
+    date_end_str = request.GET.get('end')
+    
+    today = date.today()
+    start_date = today
+    end_date = today # Inclusive
+    
+    if date_range == 'yesterday':
+        start_date = today - timedelta(days=1)
+        end_date = start_date
+    elif date_range == 'week':
+        start_date = today - timedelta(days=7)
+    elif date_range == 'month':
+        start_date = today.replace(day=1)
+    elif date_range == 'custom' and date_start_str:
+        try:
+            start_date = datetime.strptime(date_start_str, '%Y-%m-%d').date()
+            if date_end_str:
+                end_date = datetime.strptime(date_end_str, '%Y-%m-%d').date()
+            else:
+                end_date = start_date
+        except ValueError:
+            pass
+            
+    # Queryset
+    # Filter by created_at range (inclusive)
+    # created_at is DateTime, so we need (start 00:00, end 23:59)
+    orders_qs = Order.objects.filter(
+        gym=gym,
+        created_at__date__gte=start_date,
+        created_at__date__lte=end_date
+    ).exclude(status='CANCELLED').select_related('client', 'created_by').prefetch_related('payments__payment_method')
+    
+    # 2. Aggregates (KPIs)
+    # Use the base queryset for metrics
+    aggregates = orders_qs.aggregate(
+        total_income=Sum('total_amount'),
+        total_tax=Sum('total_tax'),
+        total_base=Sum('total_base'),
+        count=Count('id')
+    )
+    
+    # 3. Chart Data (Daily Trend)
+    # Group by Date
+    daily_data = orders_qs.annotate(day=TruncDate('created_at')).values('day').annotate(total=Sum('total_amount')).order_by('day')
+    
+    chart_labels = []
+    chart_values = []
+    
+    # Fill gaps if needed, or just plot points
+    for entry in daily_data:
+        chart_labels.append(entry['day'].strftime('%d/%m'))
+        chart_values.append(float(entry['total']))
+        
+    # 4. Filters (for dropdowns)
+    payment_methods = PaymentMethod.objects.filter(gym=gym, is_active=True)
+    
+    # 5. Scheduled Payments (Cobros Futuros / Recurrentes)
+    from clients.models import ClientMembership
+    scheduled_payments = ClientMembership.objects.filter(
+        client__gym=gym,
+        is_recurring=True,
+        # status__in=['ACTIVE', 'PENDING'] # Depending on definition
+        status='ACTIVE'
+    ).select_related('client').order_by('end_date')
+
+    context = {
+        'title': 'Informe de Facturación',
+        'orders': orders_qs.order_by('-created_at'), # Pass explicit queryset
+        'scheduled_payments': scheduled_payments,
+        'metrics': {
+            'total': aggregates['total_income'] or 0,
+            'tax': aggregates['total_tax'] or 0,
+            'base': aggregates['total_base'] or 0,
+            'count': aggregates['count'] or 0
+        },
+        'chart': {
+            'labels': chart_labels,
+            'values': chart_values
+        },
+        'filters': {
+            'range': date_range,
+            'start': start_date.strftime('%Y-%m-%d'),
+            'end': end_date.strftime('%Y-%m-%d'),
+            'methods': payment_methods
+        },
+        'debug_start': start_date,
+        'debug_end': end_date
+    }
+    
+    return render(request, 'backoffice/finance/billing_dashboard.html', context)

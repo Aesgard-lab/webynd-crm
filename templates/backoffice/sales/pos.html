@@ -118,6 +118,43 @@
             </div>
         </div>
 
+        <!-- Sale Options (Date/Time/Staff) -->
+        <div class="p-4 border-b border-slate-200 bg-white" x-data="{ showOptions: false }">
+            <button @click="showOptions = !showOptions"
+                class="text-xs font-medium text-slate-500 hover:text-[var(--brand-color)] flex items-center gap-1 w-full justify-between">
+                <span>Opciones de Venta (Fecha / Staff)</span>
+                <svg class="w-4 h-4 transition-transform" :class="{'rotate-180': showOptions}" fill="none"
+                    stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path>
+                </svg>
+            </button>
+
+            <div x-show="showOptions" class="mt-3 space-y-3" x-transition>
+                <div class="grid grid-cols-2 gap-2">
+                    <div>
+                        <label class="block text-[10px] font-bold text-slate-400 uppercase mb-1">Fecha</label>
+                        <input type="date" x-model="customDate"
+                            class="w-full text-sm px-2 py-1 border border-slate-200 rounded-lg">
+                    </div>
+                    <div>
+                        <label class="block text-[10px] font-bold text-slate-400 uppercase mb-1">Hora</label>
+                        <input type="time" x-model="customTime"
+                            class="w-full text-sm px-2 py-1 border border-slate-200 rounded-lg">
+                    </div>
+                </div>
+                <div>
+                    <label class="block text-[10px] font-bold text-slate-400 uppercase mb-1">Cobrado por</label>
+                    <select x-model="customStaffId"
+                        class="w-full text-sm px-2 py-1 border border-slate-200 rounded-lg bg-white">
+                        <option value="">Yo ({{ request.user.first_name }} {{ request.user.last_name }})</option>
+                        {% for u in staff_users %}
+                        <option value="{{ u.id }}">{{ u.first_name }} {{ u.last_name }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+            </div>
+        </div>
+
         <!-- Cart Items -->
         <div class="flex-1 overflow-y-auto p-4 bg-slate-50/30">
             <template x-for="(item, index) in cart" :key="index">
@@ -337,6 +374,11 @@
             cart: [],
             selectedClient: null,
 
+            // Overrides
+            customDate: '',
+            customTime: '',
+            customStaffId: '',
+
             // Payment Logic
             paymentLines: [],
             availableMethods: [],
@@ -372,8 +414,26 @@
                 // Handle URL Params
                 const urlParams = new URLSearchParams(window.location.search);
                 const clientId = urlParams.get('client_id');
+                const autoAddQuery = urlParams.get('auto_add_query');
+
                 if (clientId) {
                     this.preSelectClient(clientId);
+                }
+
+                if (autoAddQuery) {
+                    this.searchQuery = autoAddQuery;
+                    this.searchProducts().then(() => {
+                        // Auto-add if exact match or single result
+                        if (this.products.length > 0) {
+                            // Try to find exact match
+                            const exact = this.products.find(p => p.name.toLowerCase() === autoAddQuery.toLowerCase());
+                            if (exact) {
+                                this.addToCart(exact);
+                            } else if (this.products.length === 1) {
+                                this.addToCart(this.products[0]);
+                            }
+                        }
+                    });
                 }
             },
 
@@ -611,7 +671,7 @@
                         // For now we send 0 or formatted.
                         payload.method_id = 1; // Hack: Default to Cash or we need "Card" ID.
                         // Ideally we iterate defaultMethods to find one named "Stripe" or "Tarjeta".
-                        let genericCard = this.defaultMethods.find(m => m.name.toLowerCase().includes('tarjeta') || m.name.toLowerCase().includes('stripe'));
+                        let genericCard = this.availableMethods.find(m => (m.name.toLowerCase().includes('tarjeta') || m.name.toLowerCase().includes('stripe')) && !m.is_saved_card);
                         if (genericCard) payload.method_id = genericCard.id;
                     } else {
                         payload.method_id = p.method_id;
@@ -620,7 +680,7 @@
                 });
 
                 let payload = {
-                    client_id: this.selectedClient.id, // Changed from this.client.id to this.selectedClient.id
+                    client_id: this.selectedClient.id,
                     items: this.cart.map(i => ({
                         id: i.id,
                         type: i.type,
@@ -630,7 +690,12 @@
                         name: i.name
                     })),
                     payments: paymentsPayload,
-                    action: this.postAction // Changed from this.postPaymentAction to this.postAction
+                    action: this.postAction,
+
+                    // Custom Fields
+                    date: this.customDate || null,
+                    time: this.customTime || null,
+                    staff_id: this.customStaffId || null
                 };
 
                 try {

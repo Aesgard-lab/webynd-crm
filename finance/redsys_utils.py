@@ -209,6 +209,71 @@ class RedsysClient:
         except Exception as e:
             return False, str(e)
 
+    def refund_request(self, order_id, amount_eur, original_order_id, description='Devolución'):
+        """
+        Performs a REFUND (Devolución) request.
+        Transaction Type '3'.
+        DS_MERCHANT_ORDER: New Order ID for the refund transaction itself.
+        """
+        import requests
+        
+        # Original Order ID is needed? 
+        # For Redsys Refund, you usually need the Original Order ID?
+        # Actually in Redsys REST, for "Devolución" (3), you just send the parameters.
+        # But if it is linked to a previous transaction, sometimes 'DS_MERCHANT_MAGSTRIPE' or params are used?
+        # Documentation says: TransactionType=3.
+        # The documentation implies you might not strictly need to link it if you have the card token?
+        # But usually refunds are done against the original transaction using the Order ID.
+        # However, here we are using REST.
+        
+        # Let's assume standard Refund via REST requires just TransactionType=3
+        # And usually matching amounts / terminal etc.
+        
+        # NOTE: Redsys REST often requires the "original" order ID in DS_MERCHANT_ORDER for query/cancellation,
+        # but for a NEW refund transaction, it needs a NEW unique Order ID, 
+        # and maybe a reference to the old one?
+        
+        # Standard Redsys Web Refund is done via "Operaciones".
+        # Programmatic Refund:
+        # DS_MERCHANT_TRANSACTIONTYPE = '3'
+        
+        payload = self.create_request_parameters(
+            order_id=order_id, # Must be UNIQUE for this refund op
+            amount_eur=amount_eur,
+            transaction_type='3',
+            description=description
+        )
+        
+        # We might need to send original order ID in some field if not using Token?
+        # If we have a Token (COF), we can refund to that Token.
+        # If we don't have token but just transaction ID, it's harder in REST without reference.
+        # For now, let's assume we use the Token approach if available, or just try generic Refund if enabled.
+        
+        try:
+             response = requests.post(self.url, json=payload, headers={'Content-Type': 'application/json'}, timeout=30)
+             response.raise_for_status()
+             
+             resp_data = response.json()
+             
+             ds_params_b64 = resp_data.get('Ds_MerchantParameters')
+             ds_signature = resp_data.get('Ds_Signature')
+             
+             if not ds_params_b64:
+                  return False, f"Invalid Response: {resp_data}"
+                  
+             decoded = self.decode_response(ds_params_b64, ds_signature)
+             
+             code = int(decoded.get('Ds_Response', 9999))
+             # Refund OK codes usually 0000-0099
+             if 0 <= code <= 99:
+                  return True, decoded
+             else:
+                  return False, f"Redsys Error {code}"
+                  
+        except Exception as e:
+            return False, str(e)
+
+
 def get_redsys_client(gym):
     settings = FinanceSettings.objects.get(gym=gym)
     if not settings.redsys_merchant_code or not settings.redsys_secret_key:

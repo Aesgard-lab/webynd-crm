@@ -20,4 +20,7 @@ urlpatterns = [
     path('redsys/notify/', views_redsys.redsys_notify, name='redsys_notify'),
     path('redsys/ok/', views_redsys.redsys_ok, name='redsys_ok'),
     path('redsys/ko/', views_redsys.redsys_ko, name='redsys_ko'),
+    
+    # Reports
+    path('report/billing/', views.billing_dashboard, name='finance_billing_dashboard'),
 ]

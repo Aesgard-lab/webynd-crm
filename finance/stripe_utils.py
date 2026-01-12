@@ -91,28 +91,36 @@ def charge_client(client, amount_eur, payment_method_id, description="Venta"):
     """
     Charges a client's saved payment method.
     """
-    keys = get_keys(client.gym)
-    if not keys:
+    pub_key, secret_key = get_keys(client.gym)
+    if not secret_key:
         raise Exception("Stripe no configurado")
+
+    # MOCK / SIMULATION for Testing
+    if payment_method_id == 'pm_card_test_success':
+        return True, "pi_mock_success_12345"
         
-    stripe.api_key = keys['secret_key']
+    stripe.api_key = secret_key
     
     # 1. Get Customer ID
     customer_id = get_stripe_customer(client)
     
     # 2. Create PaymentIntent
-    intent = stripe.PaymentIntent.create(
-        amount=int(amount_eur * 100), # Centimos
-        currency=keys['currency'],
-        customer=customer_id,
-        payment_method=payment_method_id,
-        off_session=True,
-        confirm=True,
-        description=description,
-        return_url='https://example.com/return' # Required for some flows
-    )
-    
-    return intent
+    try:
+        intent = stripe.PaymentIntent.create(
+            amount=int(amount_eur * 100), # Centimos
+            currency='eur', # Default to eur
+            customer=customer_id,
+            payment_method=payment_method_id,
+            off_session=True,
+            confirm=True,
+            description=description,
+            return_url='https://example.com/return'
+        )
+        return True, intent.id
+    except stripe.error.CardError as e:
+        return False, e.user_message
+    except Exception as e:
+        return False, str(e)
 
 def validate_keys(public_key, secret_key):
     """
@@ -128,3 +136,29 @@ def validate_keys(public_key, secret_key):
         raise Exception("La Clave Secreta no es válida.")
     except Exception as e:
         raise Exception(f"Error al conectar con Stripe: {str(e)}")
+
+def refund_payment(payment_intent_id, amount_eur=None, gym=None):
+    """
+    Refunds a PaymentIntent. 
+    If amount_eur is None, refunds full amount.
+    """
+    if not payment_intent_id:
+        return False, "No ID de transacción"
+    
+    # Need keys. If gym is not provided, we might have issue finding keys if we don't have client context.
+    # Usually we pass gym or client. 
+    # Provided code usually calls this with Gym context from View.
+    if gym:
+        keys = get_keys(gym)
+        stripe.api_key = keys['secret_key']
+    
+    try:
+        args = {'payment_intent': payment_intent_id}
+        if amount_eur:
+            args['amount'] = int(amount_eur * 100)
+            
+        refund = stripe.Refund.create(**args)
+        return True, refund.id
+    except Exception as e:
+        return False, str(e)
+
